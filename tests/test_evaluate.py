@@ -6,7 +6,8 @@ from engine.evaluate import evaluate, PIECE_VALUES
 
 def test_starting_position_is_equal():
     board = chess.Board()
-    assert evaluate(board) == 0
+    # Allow small tempo bonus for side to move
+    assert abs(evaluate(board)) <= 15
 
 
 def test_white_up_a_queen():

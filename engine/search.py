@@ -7,7 +7,6 @@ killer moves, history heuristic, countermove heuristic, and PV ordering.
 
 import time
 import chess
-import chess.polyglot
 from engine.evaluate import evaluate, PIECE_VALUES as EVAL_PIECE_VALUES
 from engine.move_order import order_moves, record_killer, record_history, reset as reset_move_order
 
@@ -152,11 +151,6 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int,
     if board.is_repetition(2) or board.is_fifty_moves():
         return 0
 
-    if board.is_game_over():
-        if board.is_checkmate():
-            return -(MATE_SCORE - ply)
-        return 0
-
     # Mate distance pruning
     if MATE_SCORE - ply <= alpha:
         return alpha
@@ -164,7 +158,7 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int,
         return beta
 
     # TT lookup
-    tt_key = chess.polyglot.zobrist_hash(board)
+    tt_key = board._transposition_key()
     tt_score, tt_move = _tt_lookup(tt_key, depth, alpha, beta)
     if tt_score is not None and ply > 0:
         return tt_score
@@ -303,6 +297,12 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int,
                     _countermoves[cm_key] = move
             break
 
+    # No legal moves: checkmate or stalemate
+    if moves_searched == 0:
+        if in_check:
+            return -(MATE_SCORE - ply)
+        return 0  # Stalemate
+
     # Store in TT
     if best_score <= orig_alpha:
         tt_flag = TT_UPPER
@@ -356,7 +356,7 @@ def search(board: chess.Board, depth: int = 5, time_limit_ms: int = None) -> che
             current_best_score = -INF
             search_alpha = alpha
 
-            tt_key = chess.polyglot.zobrist_hash(board)
+            tt_key = board._transposition_key()
             _, pv_move = _tt_lookup(tt_key, 0, alpha, beta)
             moves = order_moves(board, depth=current_depth, tt_move=pv_move)
 
