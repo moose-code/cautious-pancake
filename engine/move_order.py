@@ -56,13 +56,19 @@ def record_history(move: chess.Move, color: bool, depth: int):
 def _move_score(board: chess.Board, move: chess.Move, depth: int,
                 countermove: chess.Move = None) -> int:
     """Score a move for ordering. Higher = searched first."""
-    # Captures via MVV-LVA
+    # Captures: winning/equal captures high, losing captures below killers
     if board.is_capture(move):
         victim = board.piece_type_at(move.to_square)
         attacker = board.piece_type_at(move.from_square)
         if victim is None:
             return 10000 + 10  # En passant
-        return 10000 + PIECE_VALUES.get(victim, 0) * 10 - PIECE_VALUES.get(attacker, 0)
+        victim_val = PIECE_VALUES.get(victim, 0)
+        attacker_val = PIECE_VALUES.get(attacker, 0)
+        mvv_lva = victim_val * 10 - attacker_val
+        if victim_val >= attacker_val:
+            return 10000 + mvv_lva  # Good captures: above killers
+        else:
+            return 5000 + mvv_lva  # Losing captures: below killers, above history
 
     # Promotions
     if move.promotion:

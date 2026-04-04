@@ -5,6 +5,7 @@ null move pruning, LMR, LMP, futility pruning, aspiration windows,
 killer moves, history heuristic, countermove heuristic, and PV ordering.
 """
 
+import math
 import time
 import chess
 from engine.evaluate import evaluate, PIECE_VALUES as EVAL_PIECE_VALUES
@@ -102,9 +103,21 @@ def _tt_store(key: int, depth: int, score: int, flag: int, best_move: chess.Move
 
 
 def quiescence(board: chess.Board, alpha: int, beta: int, depth_limit: int = 8) -> int:
-    """Quiescence search with SEE pruning."""
+    """Quiescence search with SEE pruning and TT."""
     global nodes_searched
     nodes_searched += 1
+
+    # TT lookup in quiescence
+    tt_key = board._transposition_key()
+    entry = _tt.get(tt_key)
+    if entry is not None:
+        tt_depth, tt_score, tt_flag, _ = entry
+        if tt_flag == TT_EXACT:
+            return tt_score
+        elif tt_flag == TT_LOWER and tt_score >= beta:
+            return tt_score
+        elif tt_flag == TT_UPPER and tt_score <= alpha:
+            return tt_score
 
     stand_pat = _eval_for_side(board)
 
@@ -118,10 +131,14 @@ def quiescence(board: chess.Board, alpha: int, beta: int, depth_limit: int = 8) 
     if stand_pat + 900 < alpha:
         return alpha
 
+    orig_alpha = alpha
     if stand_pat > alpha:
         alpha = stand_pat
 
-    capture_moves = [m for m in board.legal_moves if board.is_capture(m)]
+    best_score = stand_pat
+
+    # Use generate_legal_captures() - faster than filtering legal_moves
+    capture_moves = list(board.generate_legal_captures())
     capture_moves = order_moves(board, capture_moves)
 
     for move in capture_moves:
@@ -133,10 +150,21 @@ def quiescence(board: chess.Board, alpha: int, beta: int, depth_limit: int = 8) 
         score = -quiescence(board, -beta, -alpha, depth_limit - 1)
         board.pop()
 
+        if score > best_score:
+            best_score = score
+
         if score >= beta:
+            # Store lower bound in TT
+            _tt_store(tt_key, -1, score, TT_LOWER, move)
             return beta
         if score > alpha:
             alpha = score
+
+    # Store in TT
+    if best_score <= orig_alpha:
+        _tt_store(tt_key, -1, best_score, TT_UPPER, None)
+    elif best_score > orig_alpha:
+        _tt_store(tt_key, -1, best_score, TT_EXACT, None)
 
     return alpha
 
@@ -202,6 +230,11 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int,
         if static_eval - _FUTILITY_MARGIN[depth] >= beta:
             return static_eval - _FUTILITY_MARGIN[depth]
 
+    # Internal Iterative Deepening: if no TT move at PV node, do shallow search
+    if tt_move is None and is_pv and depth >= 4:
+        negamax(board, depth - 2, alpha, beta, do_null=False, ply=ply)
+        _, tt_move = _tt_lookup(tt_key, 0, alpha, beta)
+
     best_score = -INF
     best_move = None
     orig_alpha = alpha
@@ -214,6 +247,29 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int,
         countermove = _countermoves.get(cm_key)
 
     moves = order_moves(board, depth=depth, tt_move=tt_move, countermove=countermove)
+
+    # Singular extension: check if TT move is significantly better
+    singular_move = None
+    if (tt_move is not None and depth >= 6 and not in_check
+            and ply > 0):
+        entry = _tt.get(tt_key)
+        if entry is not None and entry[0] >= depth - 3 and entry[2] != TT_UPPER:
+            tt_val = entry[1]
+            s_beta = tt_val - 50
+            # Search all moves except TT move with reduced depth
+            s_score = -INF
+            for m in moves:
+                if m == tt_move:
+                    continue
+                board.push(m)
+                s = -negamax(board, depth // 2 - 1, s_beta - 1, s_beta,
+                             do_null=False, ply=ply + 1)
+                board.pop()
+                if s >= s_beta:
+                    s_score = s
+                    break
+            if s_score < s_beta:
+                singular_move = tt_move
 
     quiet_moves_searched = 0
     moves_searched = 0
@@ -242,28 +298,31 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int,
                 and _see(board, move) < -100):
             continue
 
+        # Singular extension: extend TT move if it's singular
+        extension = 0
+        if move == singular_move:
+            extension = 1
+
         board.push(move)
         gives_check = board.is_check()
 
         # PVS: search first move with full window, rest with null window
         if moves_searched == 0:
             # First move (likely PV): full window search
-            score = -negamax(board, depth - 1, -beta, -alpha,
+            score = -negamax(board, depth - 1 + extension, -beta, -alpha,
                              do_null=True, ply=ply + 1)
         else:
-            # Late move reductions for quiet non-checking moves
+            # Late move reductions: log-based formula for quiet non-checking moves
             reduction = 0
             if (moves_searched >= 3 and depth >= 3 and not in_check
                     and is_quiet and not gives_check):
-                if moves_searched >= 12:
-                    reduction = 3
-                elif moves_searched >= 6:
-                    reduction = 2
-                else:
-                    reduction = 1
+                reduction = int(0.75 + math.log(depth) * math.log(moves_searched) / 2.25)
                 # Reduce less in PV nodes
                 if is_pv and reduction > 1:
                     reduction -= 1
+                # Don't reduce to 0 or below
+                reduction = min(reduction, depth - 2)
+                reduction = max(reduction, 0)
 
             # Null window search (scout)
             score = -negamax(board, depth - 1 - reduction, -alpha - 1, -alpha,

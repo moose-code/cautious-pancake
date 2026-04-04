@@ -256,6 +256,27 @@ def _eval_pawns(board: chess.Board) -> int:
     return score
 
 
+# King ring: squares adjacent to king (precomputed)
+_KING_RING = [0] * 64
+for _sq in range(64):
+    _kr = 0
+    _f, _r = _sq % 8, _sq // 8
+    for _df in range(-1, 2):
+        for _dr in range(-1, 2):
+            _nf, _nr = _f + _df, _r + _dr
+            if 0 <= _nf < 8 and 0 <= _nr < 8:
+                _kr |= 1 << (_nr * 8 + _nf)
+    _KING_RING[_sq] = _kr
+
+# Attack weights by piece type for king safety
+_ATTACK_WEIGHT = {
+    chess.KNIGHT: 2,
+    chess.BISHOP: 2,
+    chess.ROOK: 3,
+    chess.QUEEN: 5,
+}
+
+
 def _eval_king_safety(board: chess.Board, endgame: bool) -> int:
     if endgame:
         return 0
@@ -266,24 +287,47 @@ def _eval_king_safety(board: chess.Board, endgame: bool) -> int:
     white_pawns = board.pawns & white_occ
     black_pawns = board.pawns & black_occ
 
-    for color_idx, pawns, sign in [(chess.WHITE, white_pawns, 1), (chess.BLACK, black_pawns, -1)]:
+    for color_idx, enemy_occ, pawns, sign in [
+        (chess.WHITE, black_occ, white_pawns, 1),
+        (chess.BLACK, white_occ, black_pawns, -1),
+    ]:
         king_sq = board.king(color_idx)
         king_file = chess.square_file(king_sq)
-        king_rank = chess.square_rank(king_sq)
+        king_ring = _KING_RING[king_sq]
 
+        # Pawn shield bonus
         shield_bonus = 0
+        king_rank = chess.square_rank(king_sq)
         shield_rank = king_rank + (1 if color_idx == chess.WHITE else -1)
         if 0 <= shield_rank <= 7:
             for f in range(max(0, king_file - 1), min(8, king_file + 2)):
                 if pawns & (1 << (shield_rank * 8 + f)):
                     shield_bonus += 15
 
+        # Open file penalty
         open_file_penalty = 0
         for f in range(max(0, king_file - 1), min(8, king_file + 2)):
             if not (pawns & _FILE_MASKS[f]):
                 open_file_penalty += 20
 
-        score += sign * (shield_bonus - open_file_penalty)
+        # Attack-unit system: count enemy pieces attacking king ring
+        attack_units = 0
+        attacker_count = 0
+        for piece_type, weight in _ATTACK_WEIGHT.items():
+            bb_attr = {chess.KNIGHT: 'knights', chess.BISHOP: 'bishops',
+                       chess.ROOK: 'rooks', chess.QUEEN: 'queens'}[piece_type]
+            for sq in _scan_squares(getattr(board, bb_attr) & enemy_occ):
+                attacks = board.attacks_mask(sq)
+                if attacks & king_ring:
+                    attack_units += weight
+                    attacker_count += 1
+
+        # Quadratic scaling of attack danger
+        attack_penalty = 0
+        if attacker_count >= 2:
+            attack_penalty = attack_units * attack_units // 2
+
+        score += sign * (shield_bonus - open_file_penalty - attack_penalty)
 
     return score
 
@@ -341,6 +385,75 @@ def _eval_mobility(board: chess.Board) -> int:
         score += 2 * int(board.attacks_mask(sq)).bit_count()
     for sq in _scan_squares(board.rooks & black_occ):
         score -= 2 * int(board.attacks_mask(sq)).bit_count()
+
+    return score
+
+
+def _eval_knight_outposts(board: chess.Board) -> int:
+    """Bonus for knights on outpost squares (no enemy pawns on adjacent files ahead)."""
+    score = 0
+    white_occ = board.occupied_co[chess.WHITE]
+    black_occ = board.occupied_co[chess.BLACK]
+    white_pawns = board.pawns & white_occ
+    black_pawns = board.pawns & black_occ
+
+    # White knights
+    for sq in _scan_squares(board.knights & white_occ):
+        r = sq // 8
+        f = sq % 8
+        # Must be on rank 4-6 (indices 3-5) to be an outpost
+        if r >= 3 and r <= 5:
+            # No enemy pawns on adjacent files ahead
+            if not (black_pawns & _FORWARD_SPAN_WHITE[sq] & _ADJ_FILE_MASKS[f]):
+                bonus = 25
+                # Extra bonus if supported by own pawn
+                if r > 0 and (white_pawns & _ADJ_FILE_MASKS[f] & _RANK_MASKS[r - 1]):
+                    bonus += 15
+                score += bonus
+
+    # Black knights
+    for sq in _scan_squares(board.knights & black_occ):
+        r = sq // 8
+        f = sq % 8
+        if r >= 2 and r <= 4:
+            if not (white_pawns & _FORWARD_SPAN_BLACK[sq] & _ADJ_FILE_MASKS[f]):
+                bonus = 25
+                if r < 7 and (black_pawns & _ADJ_FILE_MASKS[f] & _RANK_MASKS[r + 1]):
+                    bonus += 15
+                score -= bonus
+
+    return score
+
+
+# Masks for space evaluation: ranks 2-4 for white (indices 1-3), ranks 5-7 for black (4-6)
+_WHITE_SPACE_MASK = 0
+_BLACK_SPACE_MASK = 0
+for _r in range(1, 4):
+    _WHITE_SPACE_MASK |= _RANK_MASKS[_r]
+for _r in range(4, 7):
+    _BLACK_SPACE_MASK |= _RANK_MASKS[_r]
+# Focus on center 4 files (c-f, indices 2-5)
+_CENTER_FILES_MASK = 0
+for _f in range(2, 6):
+    _CENTER_FILES_MASK |= _FILE_MASKS[_f]
+_WHITE_SPACE_MASK &= _CENTER_FILES_MASK
+_BLACK_SPACE_MASK &= _CENTER_FILES_MASK
+
+
+def _eval_space(board: chess.Board, endgame: bool) -> int:
+    """Space advantage: control of squares in opponent's territory (middlegame only)."""
+    if endgame:
+        return 0
+    score = 0
+    white_occ = board.occupied_co[chess.WHITE]
+    black_occ = board.occupied_co[chess.BLACK]
+    white_pawns = board.pawns & white_occ
+    black_pawns = board.pawns & black_occ
+
+    # White space: pawns and pieces controlling black's territory
+    white_space = _popcount(white_pawns & _BLACK_SPACE_MASK)
+    black_space = _popcount(black_pawns & _WHITE_SPACE_MASK)
+    score += (white_space - black_space) * 8
 
     return score
 
@@ -430,6 +543,12 @@ def evaluate(board: chess.Board) -> int:
 
     # Mobility
     score += _eval_mobility(board)
+
+    # Knight outposts
+    score += _eval_knight_outposts(board)
+
+    # Space advantage
+    score += _eval_space(board, endgame)
 
     # Endgame mop-up
     if endgame:
