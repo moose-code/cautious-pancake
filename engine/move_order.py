@@ -69,8 +69,11 @@ def _move_score(board: chess.Board, move: chess.Move, depth: int) -> int:
     return _history.get(key, 0)
 
 
-def order_moves(board: chess.Board, moves=None, depth: int = 0) -> list[chess.Move]:
-    """Order moves for alpha-beta efficiency."""
+def order_moves(board: chess.Board, moves=None, depth: int = 0, tt_move: chess.Move = None) -> list[chess.Move]:
+    """Order moves for alpha-beta efficiency. TT/PV move is searched first."""
     if moves is None:
         moves = list(board.legal_moves)
+    if tt_move is not None and tt_move in moves:
+        moves.remove(tt_move)
+        return [tt_move] + sorted(moves, key=lambda m: _move_score(board, m, depth), reverse=True)
     return sorted(moves, key=lambda m: _move_score(board, m, depth), reverse=True)

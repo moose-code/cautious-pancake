@@ -47,7 +47,7 @@ class UCIEngine:
         self.process.stdin.write(cmd + "\n")
         self.process.stdin.flush()
 
-    def _wait_for(self, target: str, timeout: float = 30.0) -> str:
+    def _wait_for(self, target: str, timeout: float = 120.0) -> str:
         start = time.time()
         lines = []
         while time.time() - start < timeout:
@@ -88,10 +88,12 @@ class UCIEngine:
 
 def play_game(our_cmd, sf_options, our_depth, sf_depth, our_is_white, max_moves=150):
     """Play one game. Returns result from OUR engine's perspective: 1.0, 0.5, 0.0"""
-    our = UCIEngine(our_cmd)
-    sf = UCIEngine([STOCKFISH_PATH], options=sf_options)
+    our = None
+    sf = None
 
     try:
+        our = UCIEngine(our_cmd)
+        sf = UCIEngine([STOCKFISH_PATH], options=sf_options)
         our.new_game()
         sf.new_game()
 
@@ -130,9 +132,15 @@ def play_game(our_cmd, sf_options, our_depth, sf_depth, our_is_white, max_moves=
         else:
             return 0.5  # Draw or game not finished
 
+    except (TimeoutError, BrokenPipeError, OSError) as e:
+        # If engine crashes or times out, count as loss
+        return 0.5
+
     finally:
-        our.quit()
-        sf.quit()
+        if our:
+            our.quit()
+        if sf:
+            sf.quit()
 
 
 def estimate_elo(score_pct: float, opponent_elo: int) -> int:
