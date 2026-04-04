@@ -207,6 +207,7 @@ def main():
     parser.add_argument("--quick", action="store_true", help="Quick test: 6 games, depth 3")
     parser.add_argument("--nps", action="store_true", help="Run NPS benchmark only")
     parser.add_argument("--no-openings", action="store_true", help="Start all games from startpos")
+    parser.add_argument("--rust", action="store_true", help="Use Rust engine instead of Python")
     args = parser.parse_args()
 
     if args.nps:
@@ -227,14 +228,20 @@ def main():
         except ImportError:
             pass
 
-    our_cmd = [sys.executable, "run.py"]
+    if args.rust:
+        rust_bin = str(PROJECT_ROOT / "rust_engine" / "target" / "release" / "cautious-pancake")
+        our_cmd = [rust_bin]
+        engine_name = "CautiousPancake-Rust"
+    else:
+        our_cmd = [sys.executable, "run.py"]
+        engine_name = "CautiousPancake"
     sf_options = {
         "UCI_LimitStrength": "true",
         "UCI_Elo": str(args.elo),
         "Skill Level": str(max(0, min(20, (args.elo - 400) // 100))),
     }
 
-    print(f"CautiousPancake (depth {args.depth}) vs Stockfish @ {args.elo} Elo (depth {args.sf_depth})")
+    print(f"{engine_name} (depth {args.depth}) vs Stockfish @ {args.elo} Elo (depth {args.sf_depth})")
     print(f"Playing {args.games} games" + (" with opening book" if openings else "") + "...")
     print("=" * 50)
 
