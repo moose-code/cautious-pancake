@@ -1,0 +1,19 @@
+[project]
+name = "cautious-pancake"
+version = "0.1.0"
+description = "A chess engine built iteratively to maximize Elo"
+requires-python = ">=3.10"
+dependencies = [
+    "chess==1.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+cautious-pancake = "engine.uci:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
