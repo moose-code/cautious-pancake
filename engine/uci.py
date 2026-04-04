@@ -4,7 +4,7 @@ Handles stdin/stdout communication following the Universal Chess Interface spec.
 """
 
 import chess
-from engine.search import search
+from engine.search import search, clear_tt
 from engine.time_manager import allocate_time
 
 ENGINE_NAME = "CautiousPancake"
@@ -37,6 +37,7 @@ def main():
 
         elif cmd == "ucinewgame":
             board = chess.Board()
+            clear_tt()
 
         elif cmd == "position":
             board = _parse_position(tokens)

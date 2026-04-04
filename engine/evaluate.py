@@ -294,6 +294,45 @@ def _eval_mobility(board: chess.Board) -> int:
     return score
 
 
+def _center_distance(sq: int) -> int:
+    """Manhattan distance from center (3.5, 3.5). Higher = further from center."""
+    f = chess.square_file(sq)
+    r = chess.square_rank(sq)
+    return abs(f - 3) + abs(r - 3)  # Simplified, max=6
+
+
+def _king_distance(sq1: int, sq2: int) -> int:
+    """Chebyshev distance between two squares."""
+    f1, r1 = chess.square_file(sq1), chess.square_rank(sq1)
+    f2, r2 = chess.square_file(sq2), chess.square_rank(sq2)
+    return max(abs(f1 - f2), abs(r1 - r2))
+
+
+def _eval_mopup(board: chess.Board, material_score: int) -> int:
+    """In winning endgames, incentivize driving the losing king to the corner
+    and bringing our king close to theirs."""
+    # Only apply when one side has significant material advantage
+    if abs(material_score) < 200:
+        return 0
+
+    if material_score > 0:
+        # White is winning - push black king to corner
+        losing_king = board.king(chess.BLACK)
+        winning_king = board.king(chess.WHITE)
+    else:
+        # Black is winning - push white king to corner
+        losing_king = board.king(chess.WHITE)
+        winning_king = board.king(chess.BLACK)
+
+    # Reward: losing king far from center + kings close together
+    corner_bonus = _center_distance(losing_king) * 10
+    close_bonus = (7 - _king_distance(winning_king, losing_king)) * 5
+
+    mopup = corner_bonus + close_bonus
+
+    return mopup if material_score > 0 else -mopup
+
+
 def evaluate(board: chess.Board) -> int:
     """Evaluate a position from white's perspective."""
     if board.is_checkmate():
@@ -341,5 +380,9 @@ def evaluate(board: chess.Board) -> int:
 
     # Mobility
     score += _eval_mobility(board)
+
+    # Endgame mop-up: when winning, drive enemy king to corner
+    if endgame:
+        score += _eval_mopup(board, score)
 
     return score
