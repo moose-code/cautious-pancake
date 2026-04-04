@@ -71,7 +71,9 @@ python -m pytest tests/ -v
 |---|---|---|
 | Python Phase 7 | ~2043 | PVS, SEE, countermoves, pawn eval |
 | Python WP1-7 | ~2029 | Speed fixes, eval enhancements |
-| Rust port | ~2520 | Same algorithms, 100x faster search |
+| Rust v1 (depth 6) | ~2520 | Port to Rust, 100x faster |
+| Rust v2 (depth 8) | ~3073 | Null move, array TT, tapered eval |
+| Rust v2 (depth 10) | ~3590 | Same engine, deeper search |
 
 ## Engine Features
 

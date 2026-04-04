@@ -176,7 +176,7 @@ fn parse_go(tokens: &[&str], is_white: bool) -> (i32, Option<u64>) {
     if infinite {
         return (50, None);
     }
-    (6, None) // Default depth 6 for Rust (was 4 for Python)
+    (10, None) // Default depth 10
 }
 
 pub fn uci_loop() {
