@@ -160,18 +160,34 @@ def _eval_pawns(board: chess.Board) -> int:
         if not (white_pawn_bb & _ADJ_FILE_MASKS[f]):
             score -= 20
 
+        # Backward pawn: not defended by adjacent pawns and can't advance safely
+        if f > 0 and f < 7:
+            behind_mask = 0
+            for br in range(0, r):
+                behind_mask |= _rank_mask(br)
+            if not (white_pawn_bb & _ADJ_FILE_MASKS[f] & behind_mask):
+                # Check if the stop square is controlled by enemy pawns
+                stop_sq = (r + 1) * 8 + f
+                if stop_sq < 64 and (black_pawn_bb & _ADJ_FILE_MASKS[f] & _rank_mask(r + 1)):
+                    score -= 12
+
         # Passed pawn: no enemy pawns can block or capture on the way
         is_passed = True
         check_mask = _FILE_MASKS[f] | _ADJ_FILE_MASKS[f]
         for check_rank in range(r + 1, 8):
-            sq_check = check_rank * 8 + f
-            # Check all squares on file and adjacent files ahead
             if black_pawn_bb & check_mask & _rank_mask(check_rank):
                 is_passed = False
                 break
         if is_passed:
             # Bonus increases with rank (closer to promotion)
-            score += 20 + (r - 1) * 15
+            bonus = 20 + (r - 1) * 18
+            # Connected passed pawn bonus
+            if white_pawn_bb & _ADJ_FILE_MASKS[f] & _rank_mask(r):
+                bonus += 15
+            # Protected passer bonus
+            if white_pawn_bb & _ADJ_FILE_MASKS[f] & _rank_mask(r - 1):
+                bonus += 10
+            score += bonus
 
     for sq in black_pawns:
         f = chess.square_file(sq)
@@ -184,6 +200,16 @@ def _eval_pawns(board: chess.Board) -> int:
         if not (black_pawn_bb & _ADJ_FILE_MASKS[f]):
             score += 20
 
+        # Backward pawn for black
+        if f > 0 and f < 7:
+            behind_mask = 0
+            for br in range(r + 1, 8):
+                behind_mask |= _rank_mask(br)
+            if not (black_pawn_bb & _ADJ_FILE_MASKS[f] & behind_mask):
+                stop_sq = (r - 1) * 8 + f
+                if stop_sq >= 0 and (white_pawn_bb & _ADJ_FILE_MASKS[f] & _rank_mask(r - 1)):
+                    score += 12
+
         is_passed = True
         check_mask = _FILE_MASKS[f] | _ADJ_FILE_MASKS[f]
         for check_rank in range(0, r):
@@ -191,7 +217,12 @@ def _eval_pawns(board: chess.Board) -> int:
                 is_passed = False
                 break
         if is_passed:
-            score -= 20 + (6 - r) * 15
+            bonus = 20 + (6 - r) * 18
+            if black_pawn_bb & _ADJ_FILE_MASKS[f] & _rank_mask(r):
+                bonus += 15
+            if black_pawn_bb & _ADJ_FILE_MASKS[f] & _rank_mask(r + 1):
+                bonus += 10
+            score -= bonus
 
     return score
 

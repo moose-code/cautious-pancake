@@ -1,14 +1,14 @@
 """Search algorithm for CautiousPancake.
 
-Negamax with alpha-beta, quiescence, iterative deepening, transposition table,
+PVS with alpha-beta, quiescence+SEE, iterative deepening, transposition table,
 null move pruning, LMR, LMP, futility pruning, aspiration windows,
-killer moves, history heuristic, and PV ordering.
+killer moves, history heuristic, countermove heuristic, and PV ordering.
 """
 
 import time
 import chess
 import chess.polyglot
-from engine.evaluate import evaluate
+from engine.evaluate import evaluate, PIECE_VALUES as EVAL_PIECE_VALUES
 from engine.move_order import order_moves, record_killer, record_history, reset as reset_move_order
 
 # Constants
@@ -22,6 +22,9 @@ TT_UPPER = 2
 _tt: dict[int, tuple[int, int, int, chess.Move | None]] = {}
 TT_MAX_SIZE = 1 << 20
 
+# Countermove table: the move that refuted the opponent's last move
+_countermoves: dict[tuple[bool, int, int], chess.Move] = {}
+
 # Stats
 nodes_searched = 0
 
@@ -29,13 +32,47 @@ nodes_searched = 0
 _FUTILITY_MARGIN = [0, 200, 350, 500]
 
 # Late move pruning: max quiet moves to search at low depths
-_LMP_THRESHOLD = [0, 5, 8, 14]
+_LMP_THRESHOLD = [0, 6, 10, 16]
+
+# SEE piece values for static exchange evaluation
+_SEE_VALUES = {
+    chess.PAWN: 100, chess.KNIGHT: 320, chess.BISHOP: 330,
+    chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 20000,
+}
 
 
 def _eval_for_side(board: chess.Board) -> int:
     """Evaluate from the perspective of the side to move."""
     raw = evaluate(board)
     return raw if board.turn == chess.WHITE else -raw
+
+
+def _see(board: chess.Board, move: chess.Move) -> int:
+    """Static Exchange Evaluation - estimate if a capture sequence is winning.
+
+    Returns approximate material gain/loss of the capture.
+    Simplified version: just check if the immediate recapture loses.
+    """
+    if not board.is_capture(move):
+        return 0
+
+    # Value of captured piece
+    victim_type = board.piece_type_at(move.to_square)
+    if victim_type is None:
+        # En passant
+        return 100
+
+    attacker_type = board.piece_type_at(move.from_square)
+    gain = _SEE_VALUES.get(victim_type, 0)
+
+    # Check if the target square is defended
+    board.push(move)
+    if board.is_attacked_by(board.turn, move.to_square):
+        # We might lose our piece
+        gain -= _SEE_VALUES.get(attacker_type, 0)
+    board.pop()
+
+    return gain
 
 
 def _tt_lookup(key: int, depth: int, alpha: int, beta: int):
@@ -57,10 +94,8 @@ def _tt_lookup(key: int, depth: int, alpha: int, beta: int):
 def _tt_store(key: int, depth: int, score: int, flag: int, best_move: chess.Move | None):
     """Store position in transposition table. Depth-preferred replacement."""
     existing = _tt.get(key)
-    # Replace if: no entry, deeper search, or same depth (fresher data)
     if existing is None or depth >= existing[0]:
         if len(_tt) >= TT_MAX_SIZE and existing is None:
-            # Evict ~25% of entries when full
             keys = list(_tt.keys())
             for k in keys[:len(keys) // 4]:
                 del _tt[k]
@@ -68,7 +103,7 @@ def _tt_store(key: int, depth: int, score: int, flag: int, best_move: chess.Move
 
 
 def quiescence(board: chess.Board, alpha: int, beta: int, depth_limit: int = 8) -> int:
-    """Quiescence search: only consider captures to avoid horizon effect."""
+    """Quiescence search with SEE pruning."""
     global nodes_searched
     nodes_searched += 1
 
@@ -91,6 +126,10 @@ def quiescence(board: chess.Board, alpha: int, beta: int, depth_limit: int = 8) 
     capture_moves = order_moves(board, capture_moves)
 
     for move in capture_moves:
+        # SEE pruning: skip clearly losing captures
+        if _see(board, move) < -50:
+            continue
+
         board.push(move)
         score = -quiescence(board, -beta, -alpha, depth_limit - 1)
         board.pop()
@@ -105,11 +144,11 @@ def quiescence(board: chess.Board, alpha: int, beta: int, depth_limit: int = 8) 
 
 def negamax(board: chess.Board, depth: int, alpha: int, beta: int,
             do_null: bool = True, ply: int = 0) -> int:
-    """Negamax with alpha-beta, TT, null move, LMR, LMP, futility, quiescence."""
+    """PVS with alpha-beta, TT, null move, LMR, LMP, futility, quiescence."""
     global nodes_searched
     nodes_searched += 1
 
-    # Draw detection (repetition, 50-move, insufficient material)
+    # Draw detection
     if board.is_repetition(2) or board.is_fifty_moves():
         return 0
 
@@ -118,7 +157,7 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int,
             return -(MATE_SCORE - ply)
         return 0
 
-    # Mate distance pruning: if we already found a shorter mate, prune
+    # Mate distance pruning
     if MATE_SCORE - ply <= alpha:
         return alpha
     if -(MATE_SCORE - ply) >= beta:
@@ -134,23 +173,25 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int,
         return quiescence(board, alpha, beta)
 
     in_check = board.is_check()
+    is_pv = beta - alpha > 1  # Are we in a PV node?
 
     # Check extension
     if in_check:
         depth += 1
 
-    # Get static eval for pruning decisions (cache it)
+    # Static eval for pruning
     static_eval = _eval_for_side(board)
 
-    # Razoring: at low depth, if static eval is far below alpha, drop to qsearch
-    if (depth <= 2 and not in_check and abs(alpha) < MATE_SCORE - 100
+    # Razoring
+    if (depth <= 2 and not in_check and not is_pv
+            and abs(alpha) < MATE_SCORE - 100
             and static_eval + 300 * depth < alpha):
         score = quiescence(board, alpha, beta)
         if score <= alpha:
             return score
 
     # Null move pruning
-    if (do_null and depth >= 3 and not in_check
+    if (do_null and depth >= 3 and not in_check and not is_pv
             and _has_non_pawn_material(board)
             and static_eval >= beta):
         board.push(chess.Move.null())
@@ -162,7 +203,8 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int,
             return beta
 
     # Reverse futility pruning
-    if (depth <= 3 and not in_check and abs(beta) < MATE_SCORE - 100):
+    if (depth <= 3 and not in_check and not is_pv
+            and abs(beta) < MATE_SCORE - 100):
         if static_eval - _FUTILITY_MARGIN[depth] >= beta:
             return static_eval - _FUTILITY_MARGIN[depth]
 
@@ -170,7 +212,14 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int,
     best_move = None
     orig_alpha = alpha
 
-    moves = order_moves(board, depth=depth, tt_move=tt_move)
+    # Get countermove for the opponent's last move
+    countermove = None
+    if board.move_stack:
+        last = board.move_stack[-1]
+        cm_key = (not board.turn, last.from_square, last.to_square)
+        countermove = _countermoves.get(cm_key)
+
+    moves = order_moves(board, depth=depth, tt_move=tt_move, countermove=countermove)
 
     quiet_moves_searched = 0
     moves_searched = 0
@@ -180,46 +229,56 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int,
         is_promotion = bool(move.promotion)
         is_quiet = not is_capture and not is_promotion
 
-        # Late move pruning: skip late quiet moves at shallow depths
-        if (is_quiet and depth <= 3 and not in_check
+        # Late move pruning
+        if (is_quiet and depth <= 3 and not in_check and not is_pv
                 and quiet_moves_searched >= _LMP_THRESHOLD[depth]
                 and abs(alpha) < MATE_SCORE - 100):
             continue
 
-        # Futility pruning: at shallow depths, skip quiet moves that can't improve alpha
-        if (is_quiet and depth <= 3 and not in_check
+        # Futility pruning
+        if (is_quiet and depth <= 3 and not in_check and not is_pv
                 and moves_searched > 0
                 and abs(alpha) < MATE_SCORE - 100
                 and static_eval + _FUTILITY_MARGIN[depth] <= alpha):
-            if is_quiet:
-                quiet_moves_searched += 1
+            quiet_moves_searched += 1
+            continue
+
+        # SEE pruning for bad captures at low depths
+        if (is_capture and depth <= 2 and not in_check
+                and _see(board, move) < -100):
             continue
 
         board.push(move)
-
-        # Check if this move gives check (for LMR decisions)
         gives_check = board.is_check()
 
-        # Late move reductions
-        if (moves_searched >= 3 and depth >= 3 and not in_check
-                and is_quiet and not gives_check):
-            # Logarithmic reduction
-            if moves_searched >= 8:
-                reduction = 2 + (1 if moves_searched >= 16 else 0)
-            elif moves_searched >= 4:
-                reduction = 1
-            else:
-                reduction = 1
-
-            score = -negamax(board, depth - 1 - reduction, -beta, -alpha,
-                             do_null=True, ply=ply + 1)
-            # Re-search at full depth if it looks promising
-            if score > alpha:
-                score = -negamax(board, depth - 1, -beta, -alpha,
-                                 do_null=True, ply=ply + 1)
-        else:
+        # PVS: search first move with full window, rest with null window
+        if moves_searched == 0:
+            # First move (likely PV): full window search
             score = -negamax(board, depth - 1, -beta, -alpha,
                              do_null=True, ply=ply + 1)
+        else:
+            # Late move reductions for quiet non-checking moves
+            reduction = 0
+            if (moves_searched >= 3 and depth >= 3 and not in_check
+                    and is_quiet and not gives_check):
+                if moves_searched >= 12:
+                    reduction = 3
+                elif moves_searched >= 6:
+                    reduction = 2
+                else:
+                    reduction = 1
+                # Reduce less in PV nodes
+                if is_pv and reduction > 1:
+                    reduction -= 1
+
+            # Null window search (scout)
+            score = -negamax(board, depth - 1 - reduction, -alpha - 1, -alpha,
+                             do_null=True, ply=ply + 1)
+
+            # Re-search with full window if scout found something better
+            if score > alpha and (reduction > 0 or score < beta):
+                score = -negamax(board, depth - 1, -beta, -alpha,
+                                 do_null=True, ply=ply + 1)
 
         board.pop()
         moves_searched += 1
@@ -237,6 +296,11 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int,
         if alpha >= beta:
             if is_quiet:
                 record_killer(move, depth)
+                # Record countermove
+                if board.move_stack:
+                    last = board.move_stack[-1]
+                    cm_key = (not board.turn, last.from_square, last.to_square)
+                    _countermoves[cm_key] = move
             break
 
     # Store in TT
@@ -263,22 +327,21 @@ def _has_non_pawn_material(board: chess.Board) -> bool:
 
 
 def search(board: chess.Board, depth: int = 5, time_limit_ms: int = None) -> chess.Move:
-    """Find the best move using iterative deepening with aspiration windows."""
+    """Find the best move using iterative deepening with aspiration windows + PVS."""
     global nodes_searched
     nodes_searched = 0
     start_time = time.time()
     reset_move_order()
-    # Don't clear TT between moves - it's valuable across the game
-    # Only clear at start of new game (via UCI ucinewgame)
+    _countermoves.clear()
 
     best_move = None
     prev_score = 0
     max_depth = depth if time_limit_ms is None else 50
 
     for current_depth in range(1, max_depth + 1):
-        # Aspiration windows: search with a narrow window around previous score
+        # Aspiration windows
         if current_depth >= 4:
-            window = 50
+            window = 40
             alpha = prev_score - window
             beta = prev_score + window
         else:
@@ -288,7 +351,6 @@ def search(board: chess.Board, depth: int = 5, time_limit_ms: int = None) -> che
         current_best = None
         current_best_score = -INF
 
-        # Aspiration window search with re-search on fail
         for attempt in range(3):
             current_best = None
             current_best_score = -INF
@@ -298,14 +360,22 @@ def search(board: chess.Board, depth: int = 5, time_limit_ms: int = None) -> che
             _, pv_move = _tt_lookup(tt_key, 0, alpha, beta)
             moves = order_moves(board, depth=current_depth, tt_move=pv_move)
 
-            for move in moves:
+            for i, move in enumerate(moves):
                 if time_limit_ms is not None:
                     elapsed_ms = (time.time() - start_time) * 1000
                     if elapsed_ms > time_limit_ms * 0.7:
                         break
 
                 board.push(move)
-                score = -negamax(board, current_depth - 1, -beta, -search_alpha, ply=1)
+
+                # PVS at root too
+                if i == 0:
+                    score = -negamax(board, current_depth - 1, -beta, -search_alpha, ply=1)
+                else:
+                    score = -negamax(board, current_depth - 1, -search_alpha - 1, -search_alpha, ply=1)
+                    if score > search_alpha and score < beta:
+                        score = -negamax(board, current_depth - 1, -beta, -search_alpha, ply=1)
+
                 board.pop()
 
                 if score > current_best_score:
@@ -314,13 +384,12 @@ def search(board: chess.Board, depth: int = 5, time_limit_ms: int = None) -> che
                 if score > search_alpha:
                     search_alpha = score
 
-            # Check if we fell outside the aspiration window
             if current_best_score <= alpha:
-                alpha = -INF  # Re-search with full window below
+                alpha = -INF
             elif current_best_score >= beta:
-                beta = INF  # Re-search with full window above
+                beta = INF
             else:
-                break  # Score is within window, done
+                break
 
         if current_best is not None:
             best_move = current_best
@@ -340,3 +409,4 @@ def search(board: chess.Board, depth: int = 5, time_limit_ms: int = None) -> che
 def clear_tt():
     """Clear the transposition table (call on ucinewgame)."""
     _tt.clear()
+    _countermoves.clear()
