@@ -119,41 +119,53 @@ const PST_KING_EG: [i32; 64] = [
     -50,-40,-30,-20,-20,-30,-40,-50,
 ];
 
-fn pst_value(piece: Piece, sq: Square, is_white: bool, endgame: bool) -> i32 {
-    let idx = if is_white {
-        sq as usize
-    } else {
-        // Mirror vertically for black
-        (sq as usize) ^ 56
-    };
+/// Phase weights for tapered eval (total = 24 in starting position)
+fn phase_weight(piece: Piece) -> i32 {
+    match piece {
+        Piece::Pawn => 0,
+        Piece::Knight => 1,
+        Piece::Bishop => 1,
+        Piece::Rook => 2,
+        Piece::Queen => 4,
+        Piece::King => 0,
+    }
+}
+
+/// Compute game phase: 0 = full endgame, 24 = full opening
+fn game_phase(board: &Board) -> i32 {
+    let mut phase = 0;
+    for &piece in &[Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen] {
+        phase += board.pieces(piece).len() as i32 * phase_weight(piece);
+    }
+    phase.min(24)
+}
+
+fn pst_value_mg(piece: Piece, sq: Square, is_white: bool) -> i32 {
+    let idx = if is_white { sq as usize } else { (sq as usize) ^ 56 };
     match piece {
         Piece::Pawn => PST_PAWN[idx],
         Piece::Knight => PST_KNIGHT[idx],
         Piece::Bishop => PST_BISHOP[idx],
         Piece::Rook => PST_ROOK[idx],
         Piece::Queen => PST_QUEEN[idx],
-        Piece::King => {
-            if endgame { PST_KING_EG[idx] } else { PST_KING_MG[idx] }
-        }
+        Piece::King => PST_KING_MG[idx],
     }
 }
 
-fn is_endgame(board: &Board) -> bool {
-    let queens = board.pieces(Piece::Queen);
-    if queens.is_empty() {
-        return true;
+fn pst_value_eg(piece: Piece, sq: Square, is_white: bool) -> i32 {
+    let idx = if is_white { sq as usize } else { (sq as usize) ^ 56 };
+    match piece {
+        Piece::Pawn => PST_PAWN[idx],
+        Piece::Knight => PST_KNIGHT[idx],
+        Piece::Bishop => PST_BISHOP[idx],
+        Piece::Rook => PST_ROOK[idx],
+        Piece::Queen => PST_QUEEN[idx],
+        Piece::King => PST_KING_EG[idx],
     }
-    for color in [Color::White, Color::Black] {
-        let our_queens = queens & board.colors(color);
-        if !our_queens.is_empty() {
-            let minors = (board.pieces(Piece::Knight) | board.pieces(Piece::Bishop) | board.pieces(Piece::Rook))
-                & board.colors(color);
-            if minors.len() > 1 {
-                return false;
-            }
-        }
-    }
-    true
+}
+
+fn _is_endgame(board: &Board) -> bool {
+    game_phase(board) <= 6
 }
 
 // File and adjacent file masks
@@ -512,54 +524,78 @@ fn is_insufficient_material(board: &Board) -> bool {
     false
 }
 
-/// Evaluate a position from white's perspective
+/// Evaluate a position from white's perspective using tapered eval
 pub fn evaluate(board: &Board) -> i32 {
-    // Check for insufficient material
     if is_insufficient_material(board) {
         return 0;
     }
 
-    let mut score = 0i32;
-    let endgame = is_endgame(board);
+    let phase = game_phase(board);
+    let mut mg_score = 0i32;
+    let mut eg_score = 0i32;
 
-    // Material + PST
+    // Material + PST (tapered for king PST)
     for &color in &[Color::White, Color::Black] {
         let sign = if color == Color::White { 1 } else { -1 };
         let is_white = color == Color::White;
-        for &piece in &[Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen, Piece::King] {
+        for &piece in &[Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen] {
             for sq in board.pieces(piece) & board.colors(color) {
-                score += sign * (piece_value(piece) + pst_value(piece, sq, is_white, endgame));
+                let val = piece_value(piece) + pst_value_mg(piece, sq, is_white);
+                mg_score += sign * val;
+                eg_score += sign * val;
             }
         }
+        // King: separate MG/EG PST
+        let king_sq = board.king(color);
+        mg_score += sign * pst_value_mg(Piece::King, king_sq, is_white);
+        eg_score += sign * pst_value_eg(Piece::King, king_sq, is_white);
     }
 
     // Bishop pair
     if (board.pieces(Piece::Bishop) & board.colors(Color::White)).len() >= 2 {
-        score += 30;
+        mg_score += 30;
+        eg_score += 50; // More valuable in endgame
     }
     if (board.pieces(Piece::Bishop) & board.colors(Color::Black)).len() >= 2 {
-        score -= 30;
+        mg_score -= 30;
+        eg_score -= 50;
     }
 
-    score += eval_pawns(board);
-    score += eval_king_safety(board, endgame);
-    score += eval_rook_placement(board);
-    score += eval_mobility(board);
-    score += eval_knight_outposts(board);
-    score += eval_space(board, endgame);
+    let pawn_score = eval_pawns(board);
+    mg_score += pawn_score;
+    eg_score += pawn_score;
 
-    if endgame {
-        score += eval_mopup(board, score);
-    }
+    // King safety only in middlegame
+    mg_score += eval_king_safety(board, false /*middlegame*/);
+
+    let rook_score = eval_rook_placement(board);
+    mg_score += rook_score;
+    eg_score += rook_score;
+
+    let mobility = eval_mobility(board);
+    mg_score += mobility;
+    eg_score += mobility;
+
+    let outpost = eval_knight_outposts(board);
+    mg_score += outpost;
+    eg_score += outpost;
+
+    mg_score += eval_space(board, phase <= 6);
+
+    // Mop-up in endgame
+    let tapered_material = (mg_score * phase + eg_score * (24 - phase)) / 24;
+    let mopup = if phase <= 6 { eval_mopup(board, tapered_material) } else { 0 };
+    eg_score += mopup;
+
+    // Tapered score
+    let score = (mg_score * phase + eg_score * (24 - phase)) / 24;
 
     // Tempo
     if board.side_to_move() == Color::White {
-        score += TEMPO_BONUS;
+        score + TEMPO_BONUS
     } else {
-        score -= TEMPO_BONUS;
+        score - TEMPO_BONUS
     }
-
-    score
 }
 
 /// Evaluate from the side to move's perspective
