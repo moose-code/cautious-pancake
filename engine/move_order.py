@@ -1,6 +1,6 @@
 """Move ordering for CautiousPancake.
 
-Captures first (MVV-LVA), then killer moves, then quiet moves.
+TT move > captures (MVV-LVA) > killer moves > countermove > history heuristic.
 """
 
 import chess
@@ -14,18 +14,17 @@ PIECE_VALUES = {
     chess.KING: 0,
 }
 
-# Killer moves: quiet moves that caused beta cutoffs, indexed by depth
-# Each depth stores up to 2 killer moves
 _killer_moves: dict[int, list[chess.Move]] = {}
-
-# History heuristic: tracks how often a move causes cutoffs
-_history: dict[tuple[bool, int, int], int] = {}  # (color, from_sq, to_sq) -> score
+_history: dict[tuple[bool, int, int], int] = {}
+_max_history = 1  # Track max to normalize
 
 
 def reset():
     """Reset killer moves and history for a new search."""
+    global _max_history
     _killer_moves.clear()
     _history.clear()
+    _max_history = 1
 
 
 def record_killer(move: chess.Move, depth: int):
@@ -40,40 +39,62 @@ def record_killer(move: chess.Move, depth: int):
 
 
 def record_history(move: chess.Move, color: bool, depth: int):
-    """Record a move that improved alpha."""
+    """Record a move that improved alpha. Uses depth^2 weighting."""
+    global _max_history
     key = (color, move.from_square, move.to_square)
-    _history[key] = _history.get(key, 0) + depth * depth
+    val = _history.get(key, 0) + depth * depth
+    _history[key] = val
+    if val > _max_history:
+        _max_history = val
+    # Age history to prevent overflow
+    if _max_history > 10000:
+        for k in _history:
+            _history[k] //= 2
+        _max_history //= 2
 
 
-def _move_score(board: chess.Board, move: chess.Move, depth: int) -> int:
+def _move_score(board: chess.Board, move: chess.Move, depth: int,
+                countermove: chess.Move = None) -> int:
     """Score a move for ordering. Higher = searched first."""
-    # Captures get high priority via MVV-LVA
+    # Captures: winning/equal captures high, losing captures below killers
     if board.is_capture(move):
         victim = board.piece_type_at(move.to_square)
         attacker = board.piece_type_at(move.from_square)
         if victim is None:
             return 10000 + 10  # En passant
-        return 10000 + PIECE_VALUES.get(victim, 0) * 10 - PIECE_VALUES.get(attacker, 0)
+        victim_val = PIECE_VALUES.get(victim, 0)
+        attacker_val = PIECE_VALUES.get(attacker, 0)
+        mvv_lva = victim_val * 10 - attacker_val
+        if victim_val >= attacker_val:
+            return 10000 + mvv_lva  # Good captures: above killers
+        else:
+            return 5000 + mvv_lva  # Losing captures: below killers, above history
 
     # Promotions
     if move.promotion:
         return 9000 + PIECE_VALUES.get(move.promotion, 0)
 
-    # Killer moves
+    # Killer moves (two slots per depth)
     killers = _killer_moves.get(depth, [])
     if move in killers:
-        return 8000
+        return 8000 + (1 if move == killers[0] else 0)
+
+    # Countermove
+    if countermove is not None and move == countermove:
+        return 7000
 
     # History heuristic
     key = (board.turn, move.from_square, move.to_square)
     return _history.get(key, 0)
 
 
-def order_moves(board: chess.Board, moves=None, depth: int = 0, tt_move: chess.Move = None) -> list[chess.Move]:
-    """Order moves for alpha-beta efficiency. TT/PV move is searched first."""
+def order_moves(board: chess.Board, moves=None, depth: int = 0,
+                tt_move: chess.Move = None, countermove: chess.Move = None) -> list[chess.Move]:
+    """Order moves for alpha-beta efficiency. TT/PV move is always first."""
     if moves is None:
         moves = list(board.legal_moves)
     if tt_move is not None and tt_move in moves:
         moves.remove(tt_move)
-        return [tt_move] + sorted(moves, key=lambda m: _move_score(board, m, depth), reverse=True)
-    return sorted(moves, key=lambda m: _move_score(board, m, depth), reverse=True)
+        rest = sorted(moves, key=lambda m: _move_score(board, m, depth, countermove), reverse=True)
+        return [tt_move] + rest
+    return sorted(moves, key=lambda m: _move_score(board, m, depth, countermove), reverse=True)

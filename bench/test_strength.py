@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Quick strength test against Stockfish at a target Elo.
+"""Strength test against Stockfish at a target Elo.
 
 Usage:
-    python bench/test_strength.py                    # Default: 10 games vs Stockfish @ 800 Elo
-    python bench/test_strength.py --elo 1200         # Test against 1200-rated Stockfish
-    python bench/test_strength.py --elo 600 --games 20
-    python bench/test_strength.py --quick            # 4 fast games for a sanity check
+    python bench/test_strength.py                        # 24 games vs Stockfish @ 2000 Elo
+    python bench/test_strength.py --elo 1800 --games 30
+    python bench/test_strength.py --quick                # 6 fast games for sanity check
+    python bench/test_strength.py --nps                  # Nodes-per-second benchmark
 """
 
 import argparse
@@ -14,6 +14,7 @@ import sys
 import time
 import chess
 import math
+import random
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -62,6 +63,12 @@ class UCIEngine:
         self._send("isready")
         self._wait_for("readyok")
 
+    def set_position_fen(self, fen: str, moves: list[str]):
+        if moves:
+            self._send(f"position fen {fen} moves {' '.join(moves)}")
+        else:
+            self._send(f"position fen {fen}")
+
     def set_position(self, moves: list[str]):
         if moves:
             self._send(f"position startpos moves {' '.join(moves)}")
@@ -86,7 +93,8 @@ class UCIEngine:
             self.process.kill()
 
 
-def play_game(our_cmd, sf_options, our_depth, sf_depth, our_is_white, max_moves=150):
+def play_game(our_cmd, sf_options, our_depth, sf_depth, our_is_white,
+              start_fen=None, max_moves=150):
     """Play one game. Returns result from OUR engine's perspective: 1.0, 0.5, 0.0"""
     our = None
     sf = None
@@ -97,7 +105,7 @@ def play_game(our_cmd, sf_options, our_depth, sf_depth, our_is_white, max_moves=
         our.new_game()
         sf.new_game()
 
-        board = chess.Board()
+        board = chess.Board(start_fen) if start_fen else chess.Board()
         moves = []
 
         for _ in range(max_moves):
@@ -108,7 +116,10 @@ def play_game(our_cmd, sf_options, our_depth, sf_depth, our_is_white, max_moves=
             engine = our if is_our_turn else sf
             depth = our_depth if is_our_turn else sf_depth
 
-            engine.set_position(moves)
+            if start_fen:
+                engine.set_position_fen(start_fen, moves)
+            else:
+                engine.set_position(moves)
             move_str = engine.go(depth=depth)
 
             if move_str in ("0000", "(none)"):
@@ -117,7 +128,6 @@ def play_game(our_cmd, sf_options, our_depth, sf_depth, our_is_white, max_moves=
             try:
                 move = board.parse_uci(move_str)
                 if move not in board.legal_moves:
-                    # Illegal move = loss
                     return 0.0 if is_our_turn else 1.0
                 board.push(move)
                 moves.append(move_str)
@@ -130,11 +140,11 @@ def play_game(our_cmd, sf_options, our_depth, sf_depth, our_is_white, max_moves=
         elif result == "0-1":
             return 0.0 if our_is_white else 1.0
         else:
-            return 0.5  # Draw or game not finished
+            return 0.5
 
-    except (TimeoutError, BrokenPipeError, OSError) as e:
-        # If engine crashes or times out, count as loss
-        return 0.5
+    except (TimeoutError, BrokenPipeError, OSError):
+        # Crashes/timeouts count as losses, not draws
+        return 0.0
 
     finally:
         if our:
@@ -145,27 +155,77 @@ def play_game(our_cmd, sf_options, our_depth, sf_depth, our_is_white, max_moves=
 
 def estimate_elo(score_pct: float, opponent_elo: int) -> int:
     """Estimate our Elo from score percentage against a known-Elo opponent."""
-    if score_pct <= 0.001:
-        score_pct = 0.001
-    if score_pct >= 0.999:
-        score_pct = 0.999
+    score_pct = max(0.001, min(0.999, score_pct))
     elo_diff = -400 * math.log10(1 / score_pct - 1)
     return int(opponent_elo + elo_diff)
 
 
+def run_nps_benchmark():
+    """Measure nodes-per-second on fixed positions."""
+    positions = [
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3",
+        "r1bq1rk1/ppp2ppp/2np1n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 w - - 0 7",
+        "r2q1rk1/pp2ppbp/2np1np1/8/2BNP1b1/2N1BP2/PPPQ2PP/R4RK1 w - - 0 10",
+        "8/pp3pk1/2p2p2/4r3/8/2P2N2/PP3PPP/4R1K1 w - - 0 25",
+    ]
+    print("NPS Benchmark (depth 4 on 5 positions):")
+    print("=" * 50)
+
+    total_nodes = 0
+    total_time = 0
+
+    # Import engine directly for NPS measurement
+    sys.path.insert(0, str(PROJECT_ROOT))
+    from engine.search import search, nodes_searched
+
+    for fen in positions:
+        board = chess.Board(fen)
+        start = time.time()
+        search(board, depth=4)
+        elapsed = time.time() - start
+
+        from engine import search as search_mod
+        nodes = search_mod.nodes_searched
+        total_nodes += nodes
+        total_time += elapsed
+        nps = int(nodes / elapsed) if elapsed > 0 else 0
+        print(f"  {fen[:40]}... {nodes:>8} nodes in {elapsed:.2f}s = {nps:>6} NPS")
+
+    avg_nps = int(total_nodes / total_time) if total_time > 0 else 0
+    print("=" * 50)
+    print(f"Total: {total_nodes} nodes in {total_time:.2f}s = {avg_nps} NPS")
+    return avg_nps
+
+
 def main():
     parser = argparse.ArgumentParser(description="Test engine strength vs Stockfish")
-    parser.add_argument("--elo", type=int, default=800, help="Stockfish target Elo (default: 800)")
-    parser.add_argument("--games", type=int, default=10, help="Number of games (default: 10)")
+    parser.add_argument("--elo", type=int, default=2000, help="Stockfish target Elo (default: 2000)")
+    parser.add_argument("--games", type=int, default=24, help="Number of games (default: 24)")
     parser.add_argument("--depth", type=int, default=4, help="Our engine search depth (default: 4)")
     parser.add_argument("--sf-depth", type=int, default=4, help="Stockfish search depth (default: 4)")
-    parser.add_argument("--quick", action="store_true", help="Quick test: 4 games, depth 3")
+    parser.add_argument("--quick", action="store_true", help="Quick test: 6 games, depth 3")
+    parser.add_argument("--nps", action="store_true", help="Run NPS benchmark only")
+    parser.add_argument("--no-openings", action="store_true", help="Start all games from startpos")
     args = parser.parse_args()
 
+    if args.nps:
+        run_nps_benchmark()
+        return
+
     if args.quick:
-        args.games = 4
+        args.games = 6
         args.depth = 3
-        args.sf_depth = 2
+        args.sf_depth = 3
+
+    # Load opening positions
+    openings = None
+    if not args.no_openings:
+        try:
+            from bench.openings import OPENINGS
+            openings = OPENINGS
+        except ImportError:
+            pass
 
     our_cmd = [sys.executable, "run.py"]
     sf_options = {
@@ -175,7 +235,7 @@ def main():
     }
 
     print(f"CautiousPancake (depth {args.depth}) vs Stockfish @ {args.elo} Elo (depth {args.sf_depth})")
-    print(f"Playing {args.games} games...")
+    print(f"Playing {args.games} games" + (" with opening book" if openings else "") + "...")
     print("=" * 50)
 
     wins = 0
@@ -185,9 +245,20 @@ def main():
     for i in range(args.games):
         our_is_white = (i % 2 == 0)
         color = "White" if our_is_white else "Black"
-        print(f"  Game {i+1}/{args.games} (we play {color})...", end=" ", flush=True)
 
-        score = play_game(our_cmd, sf_options, args.depth, args.sf_depth, our_is_white)
+        # Pick an opening position
+        start_fen = None
+        if openings:
+            start_fen = openings[i % len(openings)]
+
+        opening_name = ""
+        if start_fen:
+            opening_name = f" [{start_fen[:20]}...]"
+
+        print(f"  Game {i+1}/{args.games} ({color}){opening_name}...", end=" ", flush=True)
+
+        score = play_game(our_cmd, sf_options, args.depth, args.sf_depth,
+                          our_is_white, start_fen=start_fen)
 
         if score == 1.0:
             wins += 1
@@ -208,7 +279,6 @@ def main():
     print(f"Estimated Elo: ~{est_elo}")
     print()
 
-    # Save to tracker
     try:
         sys.path.insert(0, str(PROJECT_ROOT))
         from bench.elo_tracker import save_result
@@ -219,7 +289,7 @@ def main():
             losses=losses,
             draws=draws,
             depth=args.depth,
-            notes=f"vs Stockfish UCI_Elo={args.elo}, sf_depth={args.sf_depth}",
+            notes=f"vs SF UCI_Elo={args.elo}, sf_depth={args.sf_depth}, openings={'yes' if openings else 'no'}",
         )
     except Exception as e:
         print(f"(Could not save result: {e})")

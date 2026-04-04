@@ -19,11 +19,11 @@ def test_captures_hanging_queen():
 
 
 def test_captures_hanging_piece():
-    # White to move, black rook hanging on a5
-    board = chess.Board("rnbqkbn1/pppppppp/8/r7/8/3B4/PPPPPPPP/RNBQK1NR w KQq - 0 1")
-    move = search(board, depth=2)
-    # Bishop should capture the rook
-    assert move == chess.Move.from_uci("d3a6") or board.is_capture(move)
+    # White to move, black knight hanging on e5, white bishop on c3 can take
+    board = chess.Board("rnbqkb1r/pppp1ppp/8/4n3/8/2B5/PPPPPPPP/RN1QKBNR w KQkq - 0 1")
+    move = search(board, depth=3)
+    # Should capture the free knight
+    assert board.is_capture(move)
 
 
 def test_avoids_losing_queen():
