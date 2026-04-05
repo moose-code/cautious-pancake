@@ -6,6 +6,9 @@ use crate::move_order::MoveOrder;
 
 const INF: i32 = 99999;
 
+// Contempt: penalize draws to encourage playing on when ahead
+const CONTEMPT: i32 = 15;
+
 // Transposition table flags
 const TT_EXACT: u8 = 0;
 const TT_LOWER: u8 = 1;
@@ -183,47 +186,88 @@ impl Searcher {
         }
     }
 
+    /// Multi-ply Static Exchange Evaluation using iterative swap algorithm.
+    /// Simulates the full capture sequence on a square to determine if it's winning.
     fn see(&self, board: &Board, mv: Move) -> i32 {
         let victim = board.piece_on(mv.to);
-        match victim {
-            None => {
-                if board.piece_on(mv.from) == Some(Piece::Pawn) && mv.from.file() != mv.to.file() {
-                    return 100; // en passant
-                }
-                return 0;
-            }
-            Some(victim_piece) => {
-                let gain = see_piece_value(victim_piece);
-                let attacker = board.piece_on(mv.from).unwrap();
-                let attacker_val = see_piece_value(attacker);
+        let attacker_piece = match board.piece_on(mv.from) {
+            Some(p) => p,
+            None => return 0,
+        };
 
-                // If we capture with a less valuable piece, always good
-                if attacker_val <= gain {
-                    return gain;
-                }
+        // En passant
+        if victim.is_none() && attacker_piece == Piece::Pawn && mv.from.file() != mv.to.file() {
+            return 100;
+        }
+        // Non-capture
+        let victim_piece = match victim {
+            Some(p) => p,
+            None => return 0,
+        };
 
-                // Quick check: is the square defended at all?
-                let mut board_copy = board.clone();
-                board_copy.play_unchecked(mv);
-                // Check if opponent can recapture
-                let mut can_recapture = false;
-                board_copy.generate_moves(|mvs| {
-                    for m in mvs {
-                        if m.to == mv.to {
-                            can_recapture = true;
-                            return true;
+        // Swap list: track material gains at each step of the capture sequence
+        let mut gain: [i32; 32] = [0; 32];
+        gain[0] = see_piece_value(victim_piece);
+
+        // Simulate the capture sequence by playing moves on a copy
+        let mut current_board = board.clone();
+        let mut current_attacker_val = see_piece_value(attacker_piece);
+        let target = mv.to;
+        let mut depth = 0;
+
+        // Play the initial capture
+        current_board.play_unchecked(mv);
+        depth += 1;
+
+        // Now alternate sides, finding the least valuable attacker to the target square
+        loop {
+            // Find least valuable attacker of current side to target square
+            let _side = current_board.side_to_move();
+            let mut best_attacker_sq: Option<Square> = None;
+            let mut best_attacker_val = 99999i32;
+            let mut best_attacker_move: Option<Move> = None;
+
+            // Generate legal moves and find captures to target
+            current_board.generate_moves(|mvs| {
+                for m in mvs {
+                    if m.to == target {
+                        if let Some(p) = current_board.piece_on(m.from) {
+                            let val = see_piece_value(p);
+                            if val < best_attacker_val {
+                                best_attacker_val = val;
+                                best_attacker_sq = Some(m.from);
+                                best_attacker_move = Some(m);
+                            }
                         }
                     }
-                    false
-                });
-
-                if can_recapture {
-                    gain - attacker_val
-                } else {
-                    gain
                 }
+                false
+            });
+
+            if best_attacker_sq.is_none() || depth >= 31 {
+                break;
             }
+
+            // Negamax-style: gain[d] = piece_captured - gain[d-1]
+            gain[depth] = current_attacker_val - gain[depth - 1];
+            current_attacker_val = best_attacker_val;
+
+            // Pruning: if even capturing for free can't improve, stop
+            if (-gain[depth]).max(gain[depth - 1]) < 0 {
+                break;
+            }
+
+            current_board.play_unchecked(best_attacker_move.unwrap());
+            depth += 1;
         }
+
+        // Minimax the gain list from the back
+        while depth > 1 {
+            depth -= 1;
+            gain[depth - 1] = -((-gain[depth]).max(gain[depth - 1]));
+        }
+
+        gain[0]
     }
 
     fn has_non_pawn_material(board: &Board) -> bool {
@@ -351,10 +395,10 @@ impl Searcher {
             return 0;
         }
 
-        // Draw detection
+        // Draw detection with contempt
         let hash = board.hash();
         if board.halfmove_clock() >= 100 || self.is_repetition(hash) {
-            return 0;
+            return -CONTEMPT; // Slightly penalize draws
         }
 
         // Mate distance pruning
@@ -532,8 +576,23 @@ impl Searcher {
             }
 
             // SEE pruning for bad captures at low depths
-            if is_cap && depth <= 3 && !in_check && self.see(board, mv) < -50 * depth {
+            if is_cap && depth <= 5 && !in_check && self.see(board, mv) < -20 * depth * depth {
                 continue;
+            }
+
+            // History-based pruning: skip quiet moves with very bad history at low depths
+            if is_quiet
+                && !in_check
+                && !is_pv
+                && depth <= 4
+                && moves_searched > 0
+                && alpha.abs() < MATE_SCORE - 100
+            {
+                let hist = self.move_order.get_history(mv, board.side_to_move());
+                if hist < -(depth * depth * 100) {
+                    quiet_moves_searched += 1;
+                    continue;
+                }
             }
 
             // Extensions
@@ -561,20 +620,24 @@ impl Searcher {
             } else {
                 // LMR with precomputed table
                 let mut reduction = 0;
-                if moves_searched >= 3
-                    && depth >= 3
-                    && !in_check
-                    && is_quiet
-                    && !gives_check
-                {
-                    reduction = lmr_reduction(depth, moves_searched);
-                    if is_pv && reduction > 0 {
-                        reduction -= 1;
-                    }
-                    // Reduce more for moves with bad history
-                    let hist = self.move_order.get_history(mv, board.side_to_move());
-                    if hist < 0 {
-                        reduction += 1;
+                if moves_searched >= 2 && depth >= 3 && !in_check {
+                    if is_quiet && !gives_check {
+                        reduction = lmr_reduction(depth, moves_searched);
+                        if is_pv && reduction > 0 {
+                            reduction -= 1;
+                        }
+                        // History-based reduction adjustment
+                        let hist = self.move_order.get_history(mv, board.side_to_move());
+                        if hist < -200 {
+                            reduction += 1;
+                        } else if hist > 1000 {
+                            reduction = (reduction - 1).max(0);
+                        }
+                    } else if is_cap && !gives_check && moves_searched >= 4 {
+                        // Reduce bad captures too
+                        if self.see(board, mv) < 0 {
+                            reduction = 1;
+                        }
                     }
                     reduction = reduction.clamp(0, depth - 2);
                 }

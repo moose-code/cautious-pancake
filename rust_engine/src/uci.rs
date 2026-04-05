@@ -1,6 +1,7 @@
 use cozy_chess::*;
 use std::io::{self, BufRead, Write};
 
+use crate::book;
 use crate::search::Searcher;
 
 const ENGINE_NAME: &str = "CautiousPancake-Rust";
@@ -13,6 +14,7 @@ pub fn allocate_time(
     binc: u64,
     is_white: bool,
     movestogo: Option<u64>,
+    ply: u32,
 ) -> u64 {
     let remaining = if is_white { wtime } else { btime };
     let increment = if is_white { winc } else { binc };
@@ -22,18 +24,25 @@ pub fn allocate_time(
         None => return 5000,
     };
 
-    let base_time = if let Some(mtg) = movestogo {
-        if mtg > 0 {
-            remaining / (mtg + 1)
-        } else {
-            remaining / 30
-        }
+    // Estimate moves remaining based on game phase
+    let est_moves = if let Some(mtg) = movestogo {
+        if mtg > 0 { mtg } else { 25 }
     } else {
-        remaining / 30
+        // Use ply to estimate: more time in middlegame, less in endgame
+        if ply < 20 { 35 } // Opening: save time
+        else if ply < 60 { 25 } // Middlegame: use more time
+        else { 20 } // Endgame: faster play
     };
 
+    let base_time = remaining / (est_moves + 1);
+
+    // Add most of increment
     let allocated = base_time + increment * 8 / 10;
-    let allocated = allocated.min(remaining / 3);
+
+    // Never use more than 1/4 of remaining time (safety margin)
+    let allocated = allocated.min(remaining / 4);
+
+    // Minimum 50ms
     allocated.max(50)
 }
 
@@ -84,7 +93,7 @@ fn parse_position(tokens: &[&str]) -> (Board, Vec<u64>) {
     (board, hashes)
 }
 
-fn parse_go(tokens: &[&str], is_white: bool) -> (i32, Option<u64>) {
+fn parse_go(tokens: &[&str], is_white: bool, ply: u32) -> (i32, Option<u64>) {
     let mut depth: Option<i32> = None;
     let mut movetime: Option<u64> = None;
     let mut wtime: Option<u64> = None;
@@ -170,7 +179,7 @@ fn parse_go(tokens: &[&str], is_white: bool) -> (i32, Option<u64>) {
         return (50, Some(mt));
     }
     if wtime.is_some() || btime.is_some() {
-        let time_ms = allocate_time(wtime, btime, winc, binc, is_white, movestogo);
+        let time_ms = allocate_time(wtime, btime, winc, binc, is_white, movestogo, ply);
         return (50, Some(time_ms));
     }
     if infinite {
@@ -184,7 +193,9 @@ pub fn uci_loop() {
     let stdout = io::stdout();
     let mut board = Board::default();
     let mut hash_history: Vec<u64> = vec![board.hash()];
+    let mut ply: u32 = 0;
     let mut searcher = Searcher::new();
+    let opening_book = book::build_book();
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -218,15 +229,25 @@ pub fn uci_loop() {
             }
             "position" => {
                 let (b, hashes) = parse_position(&tokens);
+                ply = (hashes.len() as u32).saturating_sub(1);
                 board = b;
                 hash_history = hashes;
             }
             "go" => {
                 let is_white = board.side_to_move() == Color::White;
-                let (depth, time_limit) = parse_go(&tokens, is_white);
-                // Feed hash history for repetition detection
-                searcher.hash_history = hash_history.clone();
-                let mv = searcher.search(&board, depth, time_limit);
+                let (depth, time_limit) = parse_go(&tokens, is_white, ply);
+                // Try opening book first
+                let mv = if ply < 20 {
+                    if let Some(book_mv) = book::lookup(&opening_book, &board) {
+                        Some(book_mv)
+                    } else {
+                        searcher.hash_history = hash_history.clone();
+                        searcher.search(&board, depth, time_limit)
+                    }
+                } else {
+                    searcher.hash_history = hash_history.clone();
+                    searcher.search(&board, depth, time_limit)
+                };
                 let mut out = stdout.lock();
                 match mv {
                     Some(m) => writeln!(out, "bestmove {}", m).unwrap(),

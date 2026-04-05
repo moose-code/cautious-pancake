@@ -1,3 +1,4 @@
+mod book;
 mod eval;
 mod move_order;
 mod search;
