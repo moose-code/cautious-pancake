@@ -37,7 +37,7 @@ pub fn allocate_time(
     allocated.max(50)
 }
 
-fn parse_position(tokens: &[&str]) -> Board {
+fn parse_position(tokens: &[&str]) -> (Board, Vec<u64>) {
     let mut idx = 1;
     let mut board = if tokens.get(idx) == Some(&"startpos") {
         idx += 1;
@@ -55,30 +55,33 @@ fn parse_position(tokens: &[&str]) -> Board {
         Board::default()
     };
 
+    let mut hashes = Vec::new();
+    hashes.push(board.hash());
+
     if tokens.get(idx) == Some(&"moves") {
         idx += 1;
         while idx < tokens.len() {
             if let Ok(mv) = tokens[idx].parse::<Move>() {
-                // cozy-chess needs legal move validation
                 let mut legal = false;
                 board.generate_moves(|mvs| {
                     for legal_mv in mvs {
                         if legal_mv == mv {
                             legal = true;
-                            return true; // stop
+                            return true;
                         }
                     }
                     false
                 });
                 if legal {
                     board.play_unchecked(mv);
+                    hashes.push(board.hash());
                 }
             }
             idx += 1;
         }
     }
 
-    board
+    (board, hashes)
 }
 
 fn parse_go(tokens: &[&str], is_white: bool) -> (i32, Option<u64>) {
@@ -173,13 +176,14 @@ fn parse_go(tokens: &[&str], is_white: bool) -> (i32, Option<u64>) {
     if infinite {
         return (50, None);
     }
-    (6, None) // Default depth 6 for Rust (was 4 for Python)
+    (10, None) // Default depth 10
 }
 
 pub fn uci_loop() {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut board = Board::default();
+    let mut hash_history: Vec<u64> = vec![board.hash()];
     let mut searcher = Searcher::new();
 
     for line in stdin.lock().lines() {
@@ -209,14 +213,19 @@ pub fn uci_loop() {
             }
             "ucinewgame" => {
                 board = Board::default();
+                hash_history = vec![board.hash()];
                 searcher.clear();
             }
             "position" => {
-                board = parse_position(&tokens);
+                let (b, hashes) = parse_position(&tokens);
+                board = b;
+                hash_history = hashes;
             }
             "go" => {
                 let is_white = board.side_to_move() == Color::White;
                 let (depth, time_limit) = parse_go(&tokens, is_white);
+                // Feed hash history for repetition detection
+                searcher.hash_history = hash_history.clone();
                 let mv = searcher.search(&board, depth, time_limit);
                 let mut out = stdout.lock();
                 match mv {
