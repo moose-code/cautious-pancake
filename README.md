@@ -65,38 +65,47 @@ quit
 python -m pytest tests/ -v
 ```
 
-## Elo History
+## Strength Measurement
 
-| Version | Elo | Notes |
-|---|---|---|
-| Python Phase 7 | ~2043 | PVS, SEE, countermoves, pawn eval |
-| Python WP1-7 | ~2029 | Speed fixes, eval enhancements |
-| Rust v1 (depth 6) | ~2520 | Port to Rust, 100x faster |
-| Rust v2 (depth 8) | ~3073 | Null move, array TT, tapered eval |
-| Rust v2 (depth 10) | ~3590 | Same engine, deeper search |
+Tested against Stockfish with `UCI_Elo` limiter at equal fixed depths (30 games each):
+
+| Opponent | Depth | Score | W-L-D | Estimated |
+|---|---|---|---|---|
+| SF 1500 | 6 | 68% | +20 -9 =1 | ~1633 |
+| SF 1800 | 6 | 67% | +19 -9 =2 | ~1920 |
+| SF 2000 | 8 | 82% | +24 -5 =1 | ~2259 |
+| SF 2200 | 8 | 78% | +23 -6 =1 | ~2423 |
+| SF 2500 | 10 | 87% | +26 -4 =0 | ~2825 |
+
+**Important caveat:** These numbers use Stockfish's `UCI_LimitStrength` which doesn't accurately simulate a player of that rating. Real Elo against calibrated opposition (CCRL-style) would likely be lower. Sample sizes are small (30 games = ~50 Elo error bars). For a proper rating, the engine should be submitted to a rating list like CCRL or tested via CuteChess gauntlets against multiple calibrated opponents. Realistic estimate: **~2200-2600** against real opposition depending on time control.
 
 ## Engine Features
 
 ### Search
 - Principal Variation Search (PVS) with alpha-beta pruning
 - Iterative deepening with aspiration windows
-- Transposition table (TT in both main search and quiescence)
-- Null move pruning (Python only, pending Rust implementation)
-- Late move reductions (log-based formula)
-- Late move pruning, futility pruning, reverse futility pruning
+- Array-based transposition table (4M entries, in both main search and quiescence)
+- Null move pruning with adaptive R and verification search
+- Late move reductions (precomputed log-based table, history-adjusted)
+- Late move pruning, futility pruning, reverse futility pruning (to depth 5)
 - Razoring, delta pruning in quiescence
-- Static Exchange Evaluation (SEE) pruning
+- Multi-ply Static Exchange Evaluation (full swap algorithm)
+- SEE pruning for bad captures (to depth 5, quadratic threshold)
+- History-based pruning for quiet moves with bad history
 - Internal Iterative Deepening (IID)
 - Singular extensions
 - Check extensions
+- Contempt factor (15cp draw penalty)
+- Embedded opening book
 
 ### Evaluation
-- Material + piece-square tables (middlegame/endgame king tables)
+- Tapered eval (smooth middlegame/endgame blend by game phase)
+- Material + piece-square tables (separate MG/EG king tables)
 - Pawn structure: doubled, isolated, passed, connected, protected passers
 - King safety: pawn shield, open files, attack-unit system (quadratic scaling)
 - Mobility (knights, bishops, rooks)
 - Knight outposts
-- Bishop pair bonus
+- Bishop pair bonus (30 MG, 50 EG)
 - Rook on open/semi-open files, 7th rank bonus
 - Space advantage
 - Endgame mop-up (drive losing king to corner)
@@ -107,8 +116,9 @@ python -m pytest tests/ -v
 - Captures: MVV-LVA with winning/losing split
 - Promotions
 - Killer moves (2 per ply)
-- History heuristic with aging
-- Countermove heuristic (Python only)
+- History heuristic with aging + malus for non-cutoff moves
+- Countermove heuristic
+- LMR for bad captures (negative SEE)
 
 ## Project Structure
 
@@ -116,10 +126,11 @@ python -m pytest tests/ -v
 rust_engine/          - Rust engine (recommended)
   src/
     main.rs           - Entry point
-    uci.rs            - UCI protocol + time management
-    search.rs         - PVS, quiescence, TT, pruning
-    eval.rs           - Position evaluation
+    uci.rs            - UCI protocol + phase-aware time management
+    search.rs         - PVS, quiescence, TT, all pruning
+    eval.rs           - Tapered evaluation
     move_order.rs     - Move ordering heuristics
+    book.rs           - Embedded opening book
 engine/               - Python engine (prototype)
   uci.py              - UCI protocol
   search.py           - Search with all pruning techniques
